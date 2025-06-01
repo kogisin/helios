@@ -1,10 +1,11 @@
 use alloy::{network::Network, rpc::types::Log};
-use revm::primitives::{BlockEnv, TxEnv};
+use revm::context::{BlockEnv, TxEnv};
 
 use crate::fork_schedule::ForkSchedule;
 
 pub trait NetworkSpec: Network {
     fn encode_receipt(receipt: &Self::ReceiptResponse) -> Vec<u8>;
+    fn encode_transaction(tx: &Self::TransactionResponse) -> Vec<u8>;
     fn is_hash_valid(block: &Self::BlockResponse) -> bool;
     fn receipt_contains(list: &[Self::ReceiptResponse], elem: &Self::ReceiptResponse) -> bool;
     fn receipt_logs(receipt: &Self::ReceiptResponse) -> Vec<Log>;

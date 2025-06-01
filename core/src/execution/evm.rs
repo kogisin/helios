@@ -1,49 +1,47 @@
-use std::{borrow::BorrowMut, collections::HashMap, mem, sync::Arc};
+use std::{collections::HashMap, marker::PhantomData, mem, sync::Arc};
 
 use alloy::{
-    network::{primitives::HeaderResponse, BlockResponse},
-    rpc::types::{AccessListResult, EIP1186StorageProof},
+    eips::{BlockId, BlockNumberOrTag},
+    network::{primitives::HeaderResponse, BlockResponse, TransactionBuilder},
+    rpc::types::{AccessListItem, AccessListResult, EIP1186StorageProof},
 };
-use eyre::{Report, Result};
+use eyre::Result;
 use revm::{
-    primitives::{
-        address, AccessListItem, AccountInfo, Address, Bytecode, Bytes, CfgEnv, Env,
-        ExecutionResult, B256, U256,
-    },
-    Database, Evm as Revm,
+    context::{result::ExecutionResult, CfgEnv, ContextTr},
+    primitives::{address, Address, Bytes, B256, U256},
+    state::{AccountInfo, Bytecode},
+    Context, Database, ExecuteEvm, MainBuilder, MainContext,
 };
-use tracing::trace;
+use tracing::{debug, trace};
 
-use helios_common::{
-    fork_schedule::ForkSchedule,
-    network_spec::NetworkSpec,
-    types::{Account, BlockTag},
-};
+use helios_common::{fork_schedule::ForkSchedule, network_spec::NetworkSpec, types::Account};
 
 use super::{
-    errors::{EvmError, ExecutionError},
-    spec::ExecutionSpec,
+    errors::{DatabaseError, EvmError, ExecutionError},
+    providers::ExecutionProivder,
 };
 
-pub struct Evm<N: NetworkSpec> {
-    execution: Arc<dyn ExecutionSpec<N>>,
+pub struct Evm<N: NetworkSpec, E: ExecutionProivder<N>> {
+    execution: Arc<E>,
     chain_id: u64,
-    tag: BlockTag,
+    block_id: BlockId,
     fork_schedule: ForkSchedule,
+    phantom: PhantomData<N>,
 }
 
-impl<N: NetworkSpec> Evm<N> {
+impl<N: NetworkSpec, E: ExecutionProivder<N>> Evm<N, E> {
     pub fn new(
-        execution: Arc<dyn ExecutionSpec<N>>,
+        execution: Arc<E>,
         chain_id: u64,
         fork_schedule: ForkSchedule,
-        tag: BlockTag,
+        block_id: BlockId,
     ) -> Self {
         Evm {
             execution,
             chain_id,
-            tag,
+            block_id,
             fork_schedule,
+            phantom: PhantomData,
         }
     }
 
@@ -106,24 +104,25 @@ impl<N: NetworkSpec> Evm<N> {
         tx: &N::TransactionRequest,
         validate_tx: bool,
     ) -> Result<(ExecutionResult, HashMap<Address, Account>), EvmError> {
-        let mut db = ProofDB::new(self.tag, self.execution.clone());
+        let mut db = ProofDB::new(self.block_id, self.execution.clone());
         _ = db.state.prefetch_state(tx, validate_tx).await;
 
-        let env = Box::new(self.get_env(tx, self.tag, validate_tx).await);
-        let evm = Revm::builder().with_db(db).with_env(env).build();
-        let mut ctx = evm.into_context_with_handler_cfg();
+        let mut evm = self
+            .get_context(tx, self.block_id, validate_tx)
+            .await
+            .with_db(db)
+            .build_mainnet();
 
         let tx_res = loop {
-            let db = ctx.context.evm.db.borrow_mut();
+            let db = evm.db();
             if db.state.needs_update() {
+                debug!("evm cache miss: {:?}", db.state.access.as_ref().unwrap());
                 db.state.update_state().await.unwrap();
             }
 
-            let mut evm = Revm::builder().with_context_with_handler_cfg(ctx).build();
-            let res = evm.transact();
-            ctx = evm.into_context_with_handler_cfg();
+            let res = evm.replay();
 
-            let db = ctx.context.evm.db.borrow_mut();
+            let db = evm.db();
             let needs_update = db.state.needs_update();
 
             if res.is_ok() || !needs_update {
@@ -134,62 +133,77 @@ impl<N: NetworkSpec> Evm<N> {
         tx_res.map_err(|err| EvmError::Generic(format!("generic: {}", err)))
     }
 
-    async fn get_env(&self, tx: &N::TransactionRequest, tag: BlockTag, validate_tx: bool) -> Env {
+    async fn get_context(
+        &self,
+        tx: &N::TransactionRequest,
+        block_id: BlockId,
+        validate_tx: bool,
+    ) -> Context {
         let block = self
             .execution
-            .get_block(tag.into(), false)
+            .get_block(block_id, false)
             .await
             .unwrap()
-            .ok_or(ExecutionError::BlockNotFound(tag))
+            .ok_or(ExecutionError::BlockNotFound(block_id))
             .unwrap();
+
+        let mut tx_env = N::tx_env(tx);
+        if tx.output_tx_type().into() == 0 {
+            tx_env.chain_id = None;
+        } else {
+            tx_env.chain_id = Some(self.chain_id);
+        }
 
         let mut cfg = CfgEnv::default();
         cfg.chain_id = self.chain_id;
         cfg.disable_block_gas_limit = !validate_tx;
         cfg.disable_eip3607 = !validate_tx;
         cfg.disable_base_fee = !validate_tx;
+        cfg.disable_nonce_check = !validate_tx;
 
-        Env {
-            tx: N::tx_env(tx),
-            block: N::block_env(&block, &self.fork_schedule),
-            cfg,
-        }
+        Context::mainnet()
+            .with_tx(tx_env)
+            .with_block(N::block_env(&block, &self.fork_schedule))
+            .with_cfg(cfg)
     }
 }
 
-struct ProofDB<N: NetworkSpec> {
-    state: EvmState<N>,
+struct ProofDB<N: NetworkSpec, E: ExecutionProivder<N>> {
+    state: EvmState<N, E>,
 }
 
-impl<N: NetworkSpec> ProofDB<N> {
-    pub fn new(tag: BlockTag, execution: Arc<dyn ExecutionSpec<N>>) -> Self {
-        let state = EvmState::new(execution, tag);
+impl<N: NetworkSpec, E: ExecutionProivder<N>> ProofDB<N, E> {
+    pub fn new(block_id: BlockId, execution: Arc<E>) -> Self {
+        let state = EvmState::new(execution, block_id);
         ProofDB { state }
     }
 }
 
+#[derive(Debug)]
 enum StateAccess {
     Basic(Address),
     BlockHash(u64),
     Storage(Address, U256),
 }
 
-struct EvmState<N: NetworkSpec> {
+struct EvmState<N: NetworkSpec, E: ExecutionProivder<N>> {
     accounts: HashMap<Address, Account>,
     block_hash: HashMap<u64, B256>,
-    block: BlockTag,
+    block: BlockId,
     access: Option<StateAccess>,
-    execution: Arc<dyn ExecutionSpec<N>>,
+    execution: Arc<E>,
+    phantom: PhantomData<N>,
 }
 
-impl<N: NetworkSpec> EvmState<N> {
-    pub fn new(execution: Arc<dyn ExecutionSpec<N>>, block: BlockTag) -> Self {
+impl<N: NetworkSpec, E: ExecutionProivder<N>> EvmState<N, E> {
+    pub fn new(execution: Arc<E>, block: BlockId) -> Self {
         Self {
             execution,
             block,
             accounts: HashMap::new(),
             block_hash: HashMap::new(),
             access: None,
+            phantom: PhantomData,
         }
     }
 
@@ -199,7 +213,7 @@ impl<N: NetworkSpec> EvmState<N> {
                 StateAccess::Basic(address) => {
                     let account = self
                         .execution
-                        .get_account(address, None, self.block, true)
+                        .get_account(address, &[], true, self.block)
                         .await?;
 
                     self.accounts.insert(address, account);
@@ -208,7 +222,7 @@ impl<N: NetworkSpec> EvmState<N> {
                     let slot_bytes = B256::from(slot);
                     let account = self
                         .execution
-                        .get_account(address, Some(&[slot_bytes]), self.block, true)
+                        .get_account(address, &[slot_bytes], true, self.block)
                         .await?;
 
                     if let Some(stored_account) = self.accounts.get_mut(&address) {
@@ -224,12 +238,12 @@ impl<N: NetworkSpec> EvmState<N> {
                     }
                 }
                 StateAccess::BlockHash(number) => {
-                    let tag = BlockTag::Number(number);
+                    let block_id = BlockNumberOrTag::Number(number).into();
                     let block = self
                         .execution
-                        .get_block(tag.into(), false)
+                        .get_block(block_id, false)
                         .await?
-                        .ok_or(ExecutionError::BlockNotFound(tag))?;
+                        .ok_or(ExecutionError::BlockNotFound(block_id))?;
 
                     self.block_hash.insert(number, block.header().hash());
                 }
@@ -243,7 +257,7 @@ impl<N: NetworkSpec> EvmState<N> {
         self.access.is_some()
     }
 
-    pub fn get_basic(&mut self, address: Address) -> Result<AccountInfo> {
+    pub fn get_basic(&mut self, address: Address) -> Result<AccountInfo, DatabaseError> {
         if let Some(account) = self.accounts.get(&address) {
             Ok(AccountInfo::new(
                 account.account.balance,
@@ -253,26 +267,26 @@ impl<N: NetworkSpec> EvmState<N> {
             ))
         } else {
             self.access = Some(StateAccess::Basic(address));
-            eyre::bail!("state missing");
+            Err(DatabaseError::StateMissing)
         }
     }
 
-    pub fn get_storage(&mut self, address: Address, slot: U256) -> Result<U256> {
+    pub fn get_storage(&mut self, address: Address, slot: U256) -> Result<U256, DatabaseError> {
         if let Some(account) = self.accounts.get(&address) {
             if let Some(value) = account.get_storage_value(B256::from(slot)) {
                 return Ok(value);
             }
         }
         self.access = Some(StateAccess::Storage(address, slot));
-        eyre::bail!("state missing");
+        Err(DatabaseError::StateMissing)
     }
 
-    pub fn get_block_hash(&mut self, block: u64) -> Result<B256> {
+    pub fn get_block_hash(&mut self, block: u64) -> Result<B256, DatabaseError> {
         if let Some(hash) = self.block_hash.get(&block) {
             Ok(*hash)
         } else {
             self.access = Some(StateAccess::BlockHash(block));
-            eyre::bail!("state missing");
+            Err(DatabaseError::StateMissing)
         }
     }
 
@@ -281,10 +295,9 @@ impl<N: NetworkSpec> EvmState<N> {
         tx: &N::TransactionRequest,
         validate_tx: bool,
     ) -> Result<()> {
-        let block_id = Some(self.block.into());
         let account_map = self
             .execution
-            .create_extended_access_list(tx, validate_tx, block_id)
+            .get_execution_hint(tx, validate_tx, self.block)
             .await
             .map_err(EvmError::RpcError)?;
 
@@ -296,10 +309,10 @@ impl<N: NetworkSpec> EvmState<N> {
     }
 }
 
-impl<N: NetworkSpec> Database for ProofDB<N> {
-    type Error = Report;
+impl<N: NetworkSpec, E: ExecutionProivder<N>> Database for ProofDB<N, E> {
+    type Error = DatabaseError;
 
-    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Report> {
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, DatabaseError> {
         if is_precompile(&address) {
             return Ok(Some(AccountInfo::default()));
         }
@@ -313,18 +326,18 @@ impl<N: NetworkSpec> Database for ProofDB<N> {
         Ok(Some(self.state.get_basic(address)?))
     }
 
-    fn block_hash(&mut self, number: u64) -> Result<B256, Report> {
+    fn block_hash(&mut self, number: u64) -> Result<B256, DatabaseError> {
         trace!(target: "helios::evm", "fetch block hash for block={:?}", number);
         self.state.get_block_hash(number)
     }
 
-    fn storage(&mut self, address: Address, slot: U256) -> Result<U256, Report> {
+    fn storage(&mut self, address: Address, slot: U256) -> Result<U256, DatabaseError> {
         trace!(target: "helios::evm", "fetch evm state for address={:?}, slot={}", address, slot);
         self.state.get_storage(address, slot)
     }
 
-    fn code_by_hash(&mut self, _code_hash: B256) -> Result<Bytecode, Report> {
-        Err(eyre::eyre!("should never be called"))
+    fn code_by_hash(&mut self, _code_hash: B256) -> Result<Bytecode, DatabaseError> {
+        Err(DatabaseError::Unimplemented)
     }
 }
 
