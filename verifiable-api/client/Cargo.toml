@@ -1,6 +1,6 @@
 [package]
 name = "helios-verifiable-api-client"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 
 [dependencies]
@@ -13,6 +13,7 @@ reqwest-retry.workspace = true
 reqwest-middleware.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+url.workspace = true
 
 # self crates
 helios-verifiable-api-types = { path = "../types" }
