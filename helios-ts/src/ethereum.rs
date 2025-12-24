@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
-use alloy::hex::FromHex;
+use alloy::hex::{self, FromHex};
 use alloy::primitives::{Address, B256, U256};
-use alloy::rpc::types::{Filter, TransactionRequest};
+use alloy::rpc::types::{state::StateOverride, Filter, TransactionRequest};
 use eyre::Result;
 use url::Url;
 use wasm_bindgen::prelude::*;
@@ -33,7 +33,15 @@ impl Database for DatabaseType {
     fn new(config: &Config) -> Result<Self> {
         match config.database_type.as_deref() {
             Some("config") => Ok(DatabaseType::Memory(ConfigDB::new(config)?)),
-            Some("localstorage") => Ok(DatabaseType::LocalStorage(LocalStorageDB::new(config)?)),
+            Some("localstorage") => match LocalStorageDB::new(config) {
+                Ok(db) => Ok(DatabaseType::LocalStorage(db)),
+                Err(_) => {
+                    web_sys::console::warn_1(
+                        &"Helios: localStorage unavailable, falling back to in-memory checkpoint storage".into(),
+                    );
+                    Ok(DatabaseType::Memory(ConfigDB::new(config)?))
+                }
+            },
             _ => Ok(DatabaseType::Memory(ConfigDB::new(config)?)),
         }
     }
@@ -58,6 +66,7 @@ pub struct EthereumClient {
     inner: helios_ethereum::EthereumClient,
     chain_id: u64,
     active_subscriptions: HashMap<String, Subscription<Ethereum>>,
+    event_handler: Option<Function>,
 }
 
 #[wasm_bindgen]
@@ -131,6 +140,7 @@ impl EthereumClient {
             inner,
             chain_id,
             active_subscriptions: HashMap::new(),
+            event_handler: None,
         })
     }
 
@@ -158,8 +168,8 @@ impl EthereumClient {
     }
 
     #[wasm_bindgen]
-    pub async fn wait_synced(&self) {
-        self.inner.wait_synced().await;
+    pub async fn wait_synced(&self) -> Result<(), JsError> {
+        map_err(self.inner.wait_synced().await)
     }
 
     #[wasm_bindgen]
@@ -313,18 +323,32 @@ impl EthereumClient {
     }
 
     #[wasm_bindgen]
-    pub async fn call(&self, opts: JsValue, block: JsValue) -> Result<String, JsError> {
+    pub async fn call(
+        &self,
+        opts: JsValue,
+        block: JsValue,
+        state_overrides: JsValue,
+    ) -> Result<String, JsError> {
         let opts: TransactionRequest = serde_wasm_bindgen::from_value(opts)?;
         let block: BlockId = serde_wasm_bindgen::from_value(block)?;
-        let res = map_err(self.inner.call(&opts, block).await)?;
+        let state_overrides: Option<StateOverride> =
+            serde_wasm_bindgen::from_value(state_overrides)?;
+        let res = map_err(self.inner.call(&opts, block, state_overrides).await)?;
         Ok(format!("0x{}", hex::encode(res)))
     }
 
     #[wasm_bindgen]
-    pub async fn estimate_gas(&self, opts: JsValue, block: JsValue) -> Result<u32, JsError> {
+    pub async fn estimate_gas(
+        &self,
+        opts: JsValue,
+        block: JsValue,
+        state_overrides: JsValue,
+    ) -> Result<u32, JsError> {
         let opts: TransactionRequest = serde_wasm_bindgen::from_value(opts)?;
         let block: BlockId = serde_wasm_bindgen::from_value(block)?;
-        Ok(map_err(self.inner.estimate_gas(&opts, block).await)? as u32)
+        let state_overrides: Option<StateOverride> =
+            serde_wasm_bindgen::from_value(state_overrides)?;
+        Ok(map_err(self.inner.estimate_gas(&opts, block, state_overrides).await)? as u32)
     }
 
     #[wasm_bindgen]
@@ -332,10 +356,17 @@ impl EthereumClient {
         &self,
         opts: JsValue,
         block: JsValue,
+        state_overrides: JsValue,
     ) -> Result<JsValue, JsError> {
         let opts: TransactionRequest = serde_wasm_bindgen::from_value(opts)?;
         let block: BlockId = serde_wasm_bindgen::from_value(block)?;
-        let access_list_result = map_err(self.inner.create_access_list(&opts, block).await)?;
+        let state_overrides: Option<StateOverride> =
+            serde_wasm_bindgen::from_value(state_overrides)?;
+        let access_list_result = map_err(
+            self.inner
+                .create_access_list(&opts, block, state_overrides)
+                .await,
+        )?;
         Ok(serde_wasm_bindgen::to_value(&access_list_result)?)
     }
 
@@ -409,5 +440,44 @@ impl EthereumClient {
     #[wasm_bindgen]
     pub async fn client_version(&self) -> String {
         self.inner.get_client_version().await
+    }
+
+    #[wasm_bindgen]
+    pub fn set_helios_events(&mut self, handler: Function) -> Result<(), JsError> {
+        if self.event_handler.is_some() {
+            return Err(JsError::new("Attempted to set emitter more than once"));
+        }
+        self.event_handler = Some(handler.clone());
+
+        let mut rx = map_err(self.inner.new_checkpoints_recv())?;
+
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+                let checkpoint = *rx.borrow_and_update();
+                if let Some(checkpoint) = checkpoint {
+                    let formatted = format!("0x{}", hex::encode(checkpoint));
+                    if let Ok(data) = serde_wasm_bindgen::to_value(&formatted) {
+                        let _ = handler.call2(
+                            &JsValue::NULL,
+                            &JsValue::from_str("helios_checkpointUpdated"),
+                            &data,
+                        );
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub async fn get_current_checkpoint(&self) -> Result<JsValue, JsError> {
+        let checkpoint = map_err(self.inner.current_checkpoint().await)?;
+        Ok(serde_wasm_bindgen::to_value(
+            &checkpoint.map(|c| format!("0x{}", hex::encode(c))),
+        )?)
     }
 }

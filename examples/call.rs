@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::path::PathBuf;
 
 use alloy::eips::BlockNumberOrTag;
@@ -28,8 +26,8 @@ async fn main() -> eyre::Result<()> {
     // Load the rpc url using the `MAINNET_EXECUTION_RPC` environment variable
     dotenv().ok();
     let eth_rpc_url = std::env::var("MAINNET_EXECUTION_RPC")?;
-    let consensus_rpc = "https://www.lightclientdata.org";
-    info!("Consensus RPC URL: {}", consensus_rpc);
+    let consensus_rpc = "http://testing.mainnet.beacon-api.nimbus.team";
+    info!("Using consensus RPC URL: {}", consensus_rpc);
 
     // Construct the client
     let data_dir = PathBuf::from("/tmp/helios");
@@ -48,7 +46,7 @@ async fn main() -> eyre::Result<()> {
     );
 
     // Wait for Helios to sync
-    client.wait_synced().await;
+    client.wait_synced().await?;
 
     // Call on helios client
     let tx = TransactionRequest {
@@ -65,7 +63,9 @@ async fn main() -> eyre::Result<()> {
         ..Default::default()
     };
 
-    let result = client.call(&tx, BlockNumberOrTag::Latest.into()).await?;
+    let result = client
+        .call(&tx, BlockNumberOrTag::Latest.into(), None)
+        .await?;
     info!("[HELIOS] DAI total supply: {:?}", result);
 
     Ok(())

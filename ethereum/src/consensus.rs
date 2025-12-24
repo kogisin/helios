@@ -1,5 +1,4 @@
 use std::marker::PhantomData;
-use std::process;
 use std::sync::Arc;
 
 use alloy::consensus::proofs::{calculate_transaction_root, calculate_withdrawals_root};
@@ -20,7 +19,7 @@ use url::Url;
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 
 use helios_consensus_core::{
     apply_bootstrap, apply_finality_update, apply_update, calc_sync_period,
@@ -40,10 +39,18 @@ use crate::constants::MAX_REQUEST_LIGHT_CLIENT_UPDATES;
 use crate::database::Database;
 use crate::rpc::ConsensusRpc;
 
+#[derive(Debug, Clone)]
+pub enum ConsensusSyncStatus {
+    Syncing,
+    Synced,
+    Error(String),
+}
+
 pub struct ConsensusClient<S: ConsensusSpec, R: ConsensusRpc<S>, DB: Database> {
     pub block_recv: Option<Receiver<Block<Transaction>>>,
     pub finalized_block_recv: Option<watch::Receiver<Option<Block<Transaction>>>>,
     pub checkpoint_recv: watch::Receiver<Option<B256>>,
+    sync_status_recv: Mutex<watch::Receiver<ConsensusSyncStatus>>,
     shutdown_send: watch::Sender<bool>,
     genesis_time: u64,
     config: Arc<Config>,
@@ -62,6 +69,7 @@ pub struct Inner<S: ConsensusSpec, R: ConsensusRpc<S>> {
     phantom: PhantomData<S>,
 }
 
+#[async_trait::async_trait]
 impl<S: ConsensusSpec, R: ConsensusRpc<S>, DB: Database> Consensus<Block>
     for ConsensusClient<S, R, DB>
 {
@@ -71,6 +79,10 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>, DB: Database> Consensus<Block>
 
     fn finalized_block_recv(&mut self) -> Option<watch::Receiver<Option<Block<Transaction>>>> {
         self.finalized_block_recv.take()
+    }
+
+    fn checkpoint_recv(&self) -> Option<watch::Receiver<Option<B256>>> {
+        Some(self.checkpoint_recv.clone())
     }
 
     fn expected_highest_block(&self) -> u64 {
@@ -85,6 +97,22 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>, DB: Database> Consensus<Block>
         self.shutdown_send.send(true)?;
         Ok(())
     }
+
+    async fn wait_synced(&self) -> Result<()> {
+        let mut sync_status_recv = self.sync_status_recv.lock().await;
+
+        loop {
+            let status = sync_status_recv.borrow().clone();
+            match status {
+                ConsensusSyncStatus::Synced => return Ok(()),
+                ConsensusSyncStatus::Error(err) => return Err(eyre!("sync failed: {}", err)),
+                ConsensusSyncStatus::Syncing => {
+                    // Wait for status to change
+                    sync_status_recv.changed().await?;
+                }
+            }
+        }
+    }
 }
 
 impl<S: ConsensusSpec, R: ConsensusRpc<S>, DB: Database> ConsensusClient<S, R, DB> {
@@ -92,6 +120,7 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>, DB: Database> ConsensusClient<S, R, D
         let (block_send, block_recv) = channel(256);
         let (finalized_block_send, finalized_block_recv) = watch::channel(None);
         let (checkpoint_send, checkpoint_recv) = watch::channel(None);
+        let (sync_status_send, sync_status_recv) = watch::channel(ConsensusSyncStatus::Syncing);
         let (shutdown_send, shutdown_recv) = watch::channel(false);
 
         let config_clone = config.clone();
@@ -125,21 +154,25 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>, DB: Database> ConsensusClient<S, R, D
                     let res = sync_all_fallbacks(&mut inner, config.chain.chain_id).await;
                     if let Err(err) = res {
                         error!(target: "helios::consensus", err = %err, "sync failed");
-                        process::exit(1);
+                        _ = sync_status_send.send(ConsensusSyncStatus::Error(err.to_string()));
+                        return;
                     }
                 } else if let Some(fallback) = &config.fallback {
                     let res = sync_fallback(&mut inner, fallback).await;
                     if let Err(err) = res {
                         error!(target: "helios::consensus", err = %err, "sync failed");
-                        process::exit(1);
+                        _ = sync_status_send.send(ConsensusSyncStatus::Error(err.to_string()));
+                        return;
                     }
                 } else {
                     error!(target: "helios::consensus", err = %err, "sync failed");
-                    process::exit(1);
+                    _ = sync_status_send.send(ConsensusSyncStatus::Error(err.to_string()));
+                    return;
                 }
             }
 
             _ = inner.send_blocks().await;
+            _ = sync_status_send.send(ConsensusSyncStatus::Synced);
 
             let start = Instant::now() + inner.duration_until_next_update().to_std().unwrap();
             let mut interval = interval_at(start, std::time::Duration::from_secs(12));
@@ -180,6 +213,7 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>, DB: Database> ConsensusClient<S, R, D
             block_recv: Some(block_recv),
             finalized_block_recv: Some(finalized_block_recv),
             checkpoint_recv,
+            sync_status_recv: Mutex::new(sync_status_recv),
             shutdown_send,
             genesis_time,
             config: config_clone,
@@ -369,6 +403,11 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
         self.verify_finality_update(&finality_update)?;
         self.apply_finality_update(&finality_update);
 
+        if self.last_checkpoint.is_none() {
+            self.last_checkpoint = Some(checkpoint);
+            let _ = self.checkpoint_send.send(self.last_checkpoint);
+        }
+
         debug!(
             target: "helios::consensus",
             "consensus client in sync with checkpoint: 0x{}",
@@ -445,7 +484,6 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
 
         self.block_send.send(block).await?;
         self.finalized_block_send.send(Some(finalized_block))?;
-        self.checkpoint_send.send(self.last_checkpoint)?;
 
         Ok(())
     }
@@ -459,7 +497,7 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|_| panic!("unreachable"))
+            .unwrap_or_default()
             .as_secs();
 
         let time_to_next_slot = next_slot_timestamp - now;
@@ -515,6 +553,7 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
         let new_checkpoint = apply_update::<S>(&mut self.store, update);
         if new_checkpoint.is_some() {
             self.last_checkpoint = new_checkpoint;
+            let _ = self.checkpoint_send.send(self.last_checkpoint);
         }
     }
 
@@ -526,6 +565,7 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
         let new_optimistic_slot = self.store.optimistic_header.beacon().slot;
         if new_checkpoint.is_some() {
             self.last_checkpoint = new_checkpoint;
+            let _ = self.checkpoint_send.send(self.last_checkpoint);
         }
         if new_finalized_slot != prev_finalized_slot {
             self.log_finality_update(update);
@@ -577,9 +617,9 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
         let expected_time = self.slot_timestamp(slot);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|_| panic!("unreachable"));
+            .unwrap_or_default();
 
-        let delay = now - std::time::Duration::from_secs(expected_time);
+        let delay = now.saturating_sub(std::time::Duration::from_secs(expected_time));
         chrono::Duration::from_std(delay).unwrap()
     }
 

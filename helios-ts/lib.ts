@@ -112,6 +112,13 @@ export class HeliosProvider {
 
     this.#chainId = this.#client.chain_id();
     this.#eventEmitter = new EventEmitter();
+    this.#setHeliosEvents();
+  }
+
+  #setHeliosEvents() {
+    this.#client.set_helios_events((event: string, data: any) => {
+      this.#eventEmitter.emit(event, data);
+    });
   }
 
   /** @internal */
@@ -211,15 +218,13 @@ export class HeliosProvider {
         return this.#client.get_proof(req.params[0], req.params[1], req.params[2]);
       }
       case "eth_call": {
-        let res = this.#client.call(req.params[0], req.params[1]);
-        console.log(res);
-        return res;
+        return this.#client.call(req.params[0], req.params[1], req.params[2]);
       }
       case "eth_estimateGas": {
-        return this.#client.estimate_gas(req.params[0], req.params[1]);
+        return this.#client.estimate_gas(req.params[0], req.params[1], req.params[2]);
       }
       case "eth_createAccessList": {
-        return this.#client.create_access_list(req.params[0], req.params[1]);
+        return this.#client.create_access_list(req.params[0], req.params[1], req.params[2]);
       }
       case "eth_gasPrice": {
         return this.#client.gas_price();
@@ -288,6 +293,9 @@ export class HeliosProvider {
       }
       case "eth_unsubscribe": {
         return this.#client.unsubscribe(req.params[0]);
+      }
+      case "helios_getCurrentCheckpoint": {
+        return this.#client.get_current_checkpoint();
       }
       default: {
         throw new Error(`method not supported: ${req.method}`);
@@ -480,14 +488,34 @@ type Request = {
   params: any[];
 };
 
-function mapToObj(map: Map<any, any> | undefined): Object | undefined {
+/**
+ * Converts a Map to an object, including nested Maps and arrays of Maps.
+ * IMPORTANT: This function will mutate input!
+ * 
+ * @param map - The Map to convert
+ * @returns The converted object
+ */
+function mapToObj(map: Map<any, any> | undefined): Record<string, any> | undefined {
   if (!map) return undefined;
 
-  return Array.from(map).reduce((obj: any, [key, value]) => {
-    if (value !== undefined) {
-      obj[key] = value;
-    }
+  const result: Record<string, any> = {};
+  
+  for (const [key, value] of map) {
+    if (value === undefined) continue;
 
-    return obj;
-  }, {});
+    if (value instanceof Map) {
+      result[key] = mapToObj(value);
+    } else if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        if (value[i] instanceof Map) {
+          // Mutate in-place
+          value[i] = mapToObj(value[i]);
+        }
+      }
+      result[key] = value;
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
 }

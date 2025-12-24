@@ -227,7 +227,12 @@ fn apply_update_no_quorum_check<S: ConsensusSpec>(
             store.optimistic_header = store.finalized_header.clone();
         }
 
-        if store.finalized_header.beacon().slot % S::slots_per_epoch() == 0 {
+        if store
+            .finalized_header
+            .beacon()
+            .slot
+            .is_multiple_of(S::slots_per_epoch())
+        {
             let checkpoint = store.finalized_header.beacon().tree_hash_root();
             return Some(checkpoint);
         }
@@ -379,10 +384,7 @@ pub fn force_update<S: ConsensusSpec>(store: &mut LightClientStore<S>, current_s
 }
 
 pub fn expected_current_slot(now: SystemTime, genesis_time: u64) -> u64 {
-    let now = now
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| panic!("unreachable"))
-        .as_secs();
+    let now = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
     let since_genesis = now - genesis_time;
 

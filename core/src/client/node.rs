@@ -1,14 +1,13 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Duration;
 
 use alloy::consensus::BlockHeader;
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::network::BlockResponse;
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::rpc::types::{
-    AccessListItem, AccessListResult, EIP1186AccountProofResponse, EIP1186StorageProof, Filter,
-    Log, SyncInfo, SyncStatus,
+    state::StateOverride, AccessListItem, AccessListResult, EIP1186AccountProofResponse,
+    EIP1186StorageProof, Filter, Log, SyncInfo, SyncStatus,
 };
 use async_trait::async_trait;
 use eyre::{eyre, Result};
@@ -27,7 +26,7 @@ use helios_common::{
 use crate::consensus::Consensus;
 use crate::errors::ClientError;
 use crate::execution::filter_state::{FilterState, FilterType};
-use crate::time::{interval, SystemTime, UNIX_EPOCH};
+use crate::time::{SystemTime, UNIX_EPOCH};
 
 use super::api::HeliosApi;
 
@@ -135,7 +134,7 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProvider<N>> No
     async fn check_head_age(&self) -> Result<(), ClientError> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|_| panic!("unreachable"))
+            .unwrap_or_default()
             .as_secs();
 
         let tag = BlockNumberOrTag::Latest.into();
@@ -169,17 +168,16 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProvider<N>> He
         }
     }
 
-    async fn wait_synced(&self) {
-        let mut interval = interval(Duration::from_millis(100));
-        loop {
-            interval.tick().await;
-            if let Ok(SyncStatus::None) = self.syncing().await {
-                break;
-            }
-        }
+    async fn wait_synced(&self) -> Result<()> {
+        self.consensus.wait_synced().await
     }
 
-    async fn call(&self, tx: &N::TransactionRequest, block_id: BlockId) -> Result<Bytes> {
+    async fn call(
+        &self,
+        tx: &N::TransactionRequest,
+        block_id: BlockId,
+        state_overrides: Option<StateOverride>,
+    ) -> Result<Bytes> {
         self.check_blocktag_age(&block_id).await?;
         let (result, ..) = N::transact(
             tx,
@@ -188,6 +186,7 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProvider<N>> He
             self.get_chain_id().await,
             self.fork_schedule,
             block_id,
+            state_overrides,
         )
         .await?;
 
@@ -202,16 +201,22 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProvider<N>> He
         Ok(res)
     }
 
-    async fn estimate_gas(&self, tx: &N::TransactionRequest, block_id: BlockId) -> Result<u64> {
+    async fn estimate_gas(
+        &self,
+        tx: &N::TransactionRequest,
+        block_id: BlockId,
+        state_overrides: Option<StateOverride>,
+    ) -> Result<u64> {
         self.check_blocktag_age(&block_id).await?;
 
         let (result, ..) = N::transact(
             tx,
-            true,
+            false,
             self.execution.clone(),
             self.get_chain_id().await,
             self.fork_schedule,
             block_id,
+            state_overrides,
         )
         .await?;
 
@@ -222,16 +227,18 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProvider<N>> He
         &self,
         tx: &N::TransactionRequest,
         block: BlockId,
+        state_overrides: Option<StateOverride>,
     ) -> Result<AccessListResult> {
         self.check_blocktag_age(&block).await?;
 
         let (result, accounts) = N::transact(
             tx,
-            true,
+            false,
             self.execution.clone(),
             self.get_chain_id().await,
             self.fork_schedule,
             block,
+            state_overrides,
         )
         .await?;
 
@@ -420,8 +427,13 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProvider<N>> He
             .ok_or(eyre!(ClientError::BlockNotFound(block_id)))?;
 
         if let Some(excess_blob_gas) = block.header().excess_blob_gas() {
-            let is_prague = block.header().timestamp() >= self.fork_schedule.prague_timestamp;
-            let price = BlobExcessGasAndPrice::new(excess_blob_gas, is_prague).blob_gasprice;
+            // Get blob base fee update fraction based on fork
+            let blob_base_fee_update_fraction = self
+                .fork_schedule
+                .get_blob_base_fee_update_fraction(block.header().timestamp());
+
+            let price = BlobExcessGasAndPrice::new(excess_blob_gas, blob_base_fee_update_fraction)
+                .blob_gasprice;
             Ok(U256::from(price))
         } else {
             Ok(U256::ZERO)
@@ -484,5 +496,18 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProvider<N>> He
             SubscriptionType::NewHeads => Ok(self.block_broadcast.subscribe()),
             _ => Err(eyre::eyre!("Unsupported subscription type: {:?}", sub_type)),
         }
+    }
+
+    async fn current_checkpoint(&self) -> Result<Option<B256>> {
+        self.consensus
+            .checkpoint_recv()
+            .map(|recv| *recv.borrow())
+            .ok_or_else(|| eyre!("Checkpoints not supported"))
+    }
+
+    fn new_checkpoints_recv(&self) -> Result<tokio::sync::watch::Receiver<Option<B256>>> {
+        self.consensus
+            .checkpoint_recv()
+            .ok_or_else(|| eyre!("Checkpoints not supported"))
     }
 }

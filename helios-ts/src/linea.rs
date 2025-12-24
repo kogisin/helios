@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
+use alloy::hex;
 use alloy::primitives::{Address, B256, U256};
-use alloy::rpc::types::{Filter, TransactionRequest};
+use alloy::rpc::types::{state::StateOverride, Filter, TransactionRequest};
 use url::Url;
 use wasm_bindgen::prelude::*;
 use web_sys::js_sys::Function;
@@ -89,8 +90,8 @@ impl LineaClient {
     }
 
     #[wasm_bindgen]
-    pub async fn wait_synced(&self) {
-        self.inner.wait_synced().await;
+    pub async fn wait_synced(&self) -> Result<(), JsError> {
+        map_err(self.inner.wait_synced().await)
     }
 
     #[wasm_bindgen]
@@ -244,18 +245,32 @@ impl LineaClient {
     }
 
     #[wasm_bindgen]
-    pub async fn call(&self, opts: JsValue, block: JsValue) -> Result<String, JsError> {
+    pub async fn call(
+        &self,
+        opts: JsValue,
+        block: JsValue,
+        state_overrides: JsValue,
+    ) -> Result<String, JsError> {
         let opts: TransactionRequest = serde_wasm_bindgen::from_value(opts)?;
         let block: BlockId = serde_wasm_bindgen::from_value(block)?;
-        let res = map_err(self.inner.call(&opts, block).await)?;
+        let state_overrides: Option<StateOverride> =
+            serde_wasm_bindgen::from_value(state_overrides)?;
+        let res = map_err(self.inner.call(&opts, block, state_overrides).await)?;
         Ok(format!("0x{}", hex::encode(res)))
     }
 
     #[wasm_bindgen]
-    pub async fn estimate_gas(&self, opts: JsValue, block: JsValue) -> Result<u32, JsError> {
+    pub async fn estimate_gas(
+        &self,
+        opts: JsValue,
+        block: JsValue,
+        state_overrides: JsValue,
+    ) -> Result<u32, JsError> {
         let opts: TransactionRequest = serde_wasm_bindgen::from_value(opts)?;
         let block: BlockId = serde_wasm_bindgen::from_value(block)?;
-        Ok(map_err(self.inner.estimate_gas(&opts, block).await)? as u32)
+        let state_overrides: Option<StateOverride> =
+            serde_wasm_bindgen::from_value(state_overrides)?;
+        Ok(map_err(self.inner.estimate_gas(&opts, block, state_overrides).await)? as u32)
     }
 
     #[wasm_bindgen]
@@ -263,10 +278,17 @@ impl LineaClient {
         &self,
         opts: JsValue,
         block: JsValue,
+        state_overrides: JsValue,
     ) -> Result<JsValue, JsError> {
         let opts: TransactionRequest = serde_wasm_bindgen::from_value(opts)?;
         let block: BlockId = serde_wasm_bindgen::from_value(block)?;
-        let access_list_result = map_err(self.inner.create_access_list(&opts, block).await)?;
+        let state_overrides: Option<StateOverride> =
+            serde_wasm_bindgen::from_value(state_overrides)?;
+        let access_list_result = map_err(
+            self.inner
+                .create_access_list(&opts, block, state_overrides)
+                .await,
+        )?;
         Ok(serde_wasm_bindgen::to_value(&access_list_result)?)
     }
 
@@ -340,5 +362,18 @@ impl LineaClient {
     #[wasm_bindgen]
     pub async fn client_version(&self) -> String {
         self.inner.get_client_version().await
+    }
+
+    #[wasm_bindgen]
+    pub fn set_helios_events(&mut self, _handler: Function) -> Result<(), JsError> {
+        // No events have been implemented for Linea yet
+
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub async fn get_current_checkpoint(&self) -> Result<JsValue, JsError> {
+        // Linea does not support checkpoints
+        Err(JsError::new("Linea does not support checkpoints"))
     }
 }

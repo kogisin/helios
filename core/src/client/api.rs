@@ -1,7 +1,10 @@
 use alloy::{
     eips::BlockId,
     primitives::{Address, Bytes, B256, U256},
-    rpc::types::{AccessListResult, EIP1186AccountProofResponse, Filter, Log, SyncStatus},
+    rpc::types::{
+        state::StateOverride, AccessListResult, EIP1186AccountProofResponse, Filter, Log,
+        SyncStatus,
+    },
 };
 use async_trait::async_trait;
 use eyre::Result;
@@ -15,7 +18,7 @@ use helios_common::{
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait HeliosApi<N: NetworkSpec>: Send + Sync + 'static {
     // node management
-    async fn wait_synced(&self);
+    async fn wait_synced(&self) -> Result<()>;
     async fn shutdown(&self);
     // state fetch
     async fn get_balance(&self, address: Address, block_id: BlockId) -> Result<U256>;
@@ -53,12 +56,23 @@ pub trait HeliosApi<N: NetworkSpec>: Send + Sync + 'static {
         block_id: BlockId,
     ) -> Result<Option<Vec<N::ReceiptResponse>>>;
     // evm
-    async fn call(&self, tx: &N::TransactionRequest, block_id: BlockId) -> Result<Bytes>;
-    async fn estimate_gas(&self, tx: &N::TransactionRequest, block_id: BlockId) -> Result<u64>;
+    async fn call(
+        &self,
+        tx: &N::TransactionRequest,
+        block_id: BlockId,
+        state_overrides: Option<StateOverride>,
+    ) -> Result<Bytes>;
+    async fn estimate_gas(
+        &self,
+        tx: &N::TransactionRequest,
+        block_id: BlockId,
+        state_overrides: Option<StateOverride>,
+    ) -> Result<u64>;
     async fn create_access_list(
         &self,
         tx: &N::TransactionRequest,
         block_id: BlockId,
+        state_overrides: Option<StateOverride>,
     ) -> Result<AccessListResult>;
     // logs
     async fn get_logs(&self, filter: &Filter) -> Result<Vec<Log>>;
@@ -73,4 +87,7 @@ pub trait HeliosApi<N: NetworkSpec>: Send + Sync + 'static {
     async fn get_chain_id(&self) -> u64;
     async fn get_coinbase(&self) -> Result<Address>;
     async fn syncing(&self) -> Result<SyncStatus>;
+    // checkpoint
+    async fn current_checkpoint(&self) -> Result<Option<B256>>;
+    fn new_checkpoints_recv(&self) -> Result<tokio::sync::watch::Receiver<Option<B256>>>;
 }

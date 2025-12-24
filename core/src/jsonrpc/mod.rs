@@ -7,7 +7,8 @@ use alloy::network::{BlockResponse, ReceiptResponse, TransactionResponse};
 use alloy::primitives::{Address, Bytes, B256, U256, U64};
 use alloy::rpc::json_rpc::RpcObject;
 use alloy::rpc::types::{
-    AccessListResult, EIP1186AccountProofResponse, Filter, FilterChanges, Log, SyncStatus,
+    state::StateOverride, AccessListResult, EIP1186AccountProofResponse, Filter, FilterChanges,
+    Log, SyncStatus,
 };
 use eyre::{eyre, Result};
 use jsonrpsee::{
@@ -39,11 +40,13 @@ pub async fn start<N: NetworkSpec>(
     let mut methods = Methods::new();
     let eth_methods: Methods = EthRpcServer::into_rpc(rpc.clone()).into();
     let net_methods: Methods = NetRpcServer::into_rpc(rpc.clone()).into();
-    let web3_methods: Methods = Web3RpcServer::into_rpc(rpc).into();
+    let web3_methods: Methods = Web3RpcServer::into_rpc(rpc.clone()).into();
+    let helios_methods: Methods = HeliosRpcServer::into_rpc(rpc).into();
 
     methods.merge(eth_methods)?;
     methods.merge(net_methods)?;
     methods.merge(web3_methods)?;
+    methods.merge(helios_methods)?;
 
     Ok(server.start(methods))
 }
@@ -84,14 +87,25 @@ trait EthRpc<
     #[method(name = "getCode")]
     async fn get_code(&self, address: Address, block: BlockId) -> Result<Bytes, ErrorObjectOwned>;
     #[method(name = "call")]
-    async fn call(&self, tx: TXR, block: BlockId) -> Result<Bytes, ErrorObjectOwned>;
+    async fn call(
+        &self,
+        tx: TXR,
+        block: BlockId,
+        state_overrides: Option<StateOverride>,
+    ) -> Result<Bytes, ErrorObjectOwned>;
     #[method(name = "estimateGas")]
-    async fn estimate_gas(&self, tx: TXR, block: BlockId) -> Result<U64, ErrorObjectOwned>;
+    async fn estimate_gas(
+        &self,
+        tx: TXR,
+        block: BlockId,
+        state_overrides: Option<StateOverride>,
+    ) -> Result<U64, ErrorObjectOwned>;
     #[method(name = "createAccessList")]
     async fn create_access_list(
         &self,
         tx: TXR,
         block: BlockId,
+        state_overrides: Option<StateOverride>,
     ) -> Result<AccessListResult, ErrorObjectOwned>;
     #[method(name = "chainId")]
     async fn chain_id(&self) -> Result<U64, ErrorObjectOwned>;
@@ -181,6 +195,14 @@ trait Web3Rpc {
     async fn client_version(&self) -> Result<String, ErrorObjectOwned>;
 }
 
+#[rpc(client, server, namespace = "helios")]
+trait HeliosRpc {
+    #[method(name = "getCurrentCheckpoint")]
+    async fn get_current_checkpoint(&self) -> Result<Option<B256>, ErrorObjectOwned>;
+    #[subscription(name = "subscribeNewCheckpoints", unsubscribe = "unsubscribeNewCheckpoints", item = Option<B256>)]
+    async fn subscribe_new_checkpoints(&self) -> SubscriptionResult;
+}
+
 #[async_trait]
 impl<N: NetworkSpec>
     EthRpcServer<
@@ -238,16 +260,22 @@ impl<N: NetworkSpec>
         &self,
         tx: N::TransactionRequest,
         block: BlockId,
+        state_overrides: Option<StateOverride>,
     ) -> Result<Bytes, ErrorObjectOwned> {
-        convert_err(self.client.call(&tx, block).await)
+        convert_err(self.client.call(&tx, block, state_overrides).await)
     }
 
     async fn estimate_gas(
         &self,
         tx: N::TransactionRequest,
         block: BlockId,
+        state_overrides: Option<StateOverride>,
     ) -> Result<U64, ErrorObjectOwned> {
-        let res = self.client.estimate_gas(&tx, block).await.map(U64::from);
+        let res = self
+            .client
+            .estimate_gas(&tx, block, state_overrides)
+            .await
+            .map(U64::from);
 
         convert_err(res)
     }
@@ -256,8 +284,13 @@ impl<N: NetworkSpec>
         &self,
         tx: N::TransactionRequest,
         block: BlockId,
+        state_overrides: Option<StateOverride>,
     ) -> Result<AccessListResult, ErrorObjectOwned> {
-        convert_err(self.client.create_access_list(&tx, block).await)
+        convert_err(
+            self.client
+                .create_access_list(&tx, block, state_overrides)
+                .await,
+        )
     }
 
     async fn chain_id(&self) -> Result<U64, ErrorObjectOwned> {
@@ -410,7 +443,7 @@ impl<N: NetworkSpec>
     ) -> SubscriptionResult {
         let maybe_rx = self.client.subscribe(event_type).await;
 
-        handle_subscription(pending, maybe_rx).await
+        handle_eth_subscription(pending, maybe_rx).await
     }
 }
 
@@ -428,12 +461,27 @@ impl<N: NetworkSpec> Web3RpcServer for JsonRpc<N> {
     }
 }
 
+#[async_trait]
+impl<N: NetworkSpec> HeliosRpcServer for JsonRpc<N> {
+    async fn get_current_checkpoint(&self) -> Result<Option<B256>, ErrorObjectOwned> {
+        convert_err(self.client.current_checkpoint().await)
+    }
+
+    async fn subscribe_new_checkpoints(
+        &self,
+        pending: PendingSubscriptionSink,
+    ) -> SubscriptionResult {
+        let maybe_rx = self.client.new_checkpoints_recv();
+        handle_checkpoint_subscription(pending, maybe_rx).await
+    }
+}
+
 fn convert_err<T, E: Display>(res: Result<T, E>) -> Result<T, ErrorObjectOwned> {
     res.map_err(|err| ErrorObject::owned(1, err.to_string(), None::<()>))
 }
 
 /// Helper function to handle subscription acceptance/rejection and message forwarding
-async fn handle_subscription<N: NetworkSpec>(
+async fn handle_eth_subscription<N: NetworkSpec>(
     pending: PendingSubscriptionSink,
     maybe_rx: Result<SubEventRx<N>>,
 ) -> SubscriptionResult {
@@ -456,6 +504,38 @@ async fn handle_subscription<N: NetworkSpec>(
                 .reject(ErrorObject::owned(
                     2000,
                     "Subscription failed",
+                    Some(e.to_string()),
+                ))
+                .await;
+            Ok(())
+        }
+    }
+}
+
+/// Helper function to handle checkpoint subscription acceptance/rejection and message forwarding
+async fn handle_checkpoint_subscription(
+    pending: PendingSubscriptionSink,
+    maybe_rx: Result<tokio::sync::watch::Receiver<Option<B256>>>,
+) -> SubscriptionResult {
+    match maybe_rx {
+        Ok(mut rx) => {
+            let sink = pending.accept().await?;
+            tokio::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    let checkpoint = *rx.borrow_and_update();
+                    let msg = SubscriptionMessage::from_json(&checkpoint).unwrap();
+                    if sink.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Ok(())
+        }
+        Err(e) => {
+            pending
+                .reject(ErrorObject::owned(
+                    2001,
+                    "Checkpoint subscription not supported",
                     Some(e.to_string()),
                 ))
                 .await;

@@ -71,6 +71,7 @@ impl ConsensusClient {
     }
 }
 
+#[async_trait::async_trait]
 impl Consensus<Block<Transaction>> for ConsensusClient {
     fn chain_id(&self) -> u64 {
         self.chain_id
@@ -88,8 +89,17 @@ impl Consensus<Block<Transaction>> for ConsensusClient {
         self.finalized_block_recv.take()
     }
 
+    fn checkpoint_recv(&self) -> Option<watch::Receiver<Option<B256>>> {
+        None
+    }
+
     fn expected_highest_block(&self) -> u64 {
         u64::MAX
+    }
+
+    async fn wait_synced(&self) -> eyre::Result<()> {
+        // Linea consensus doesn't have a sync process, so immediately return Ok
+        Ok(())
     }
 }
 
@@ -127,7 +137,7 @@ impl Inner {
             {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap_or_else(|_| panic!("unreachable"));
+                    .unwrap_or_default();
 
                 let timestamp = Duration::from_secs(block.header.timestamp);
                 let age = now.saturating_sub(timestamp);
